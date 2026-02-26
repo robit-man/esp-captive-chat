@@ -1,12 +1,12 @@
 /*
-  PUBLIC-NODE Captive Portal + Metrics + Persistent Chat (SPIFFS)
+  SOLARNODE Captive Portal + Metrics + Forum (SPIFFS)
   Target: ESP32-C6 (Arduino core)
 
   Features:
-  - SoftAP SSID "PUBLIC-NODE" (open)
+  - SoftAP SSID "SOLARNODE" (open)
   - Captive portal behavior via DNS wildcard + HTTP redirects
   - Metrics page: remembers MAC addresses that connected in the past (SPIFFS)
-  - Chat: stores messages in SPIFFS for future visitors
+  - Forum: topics + posts stored in SPIFFS
   - LED blink: 0.5s period, PWM ~50% brightness when ON
 
   Notes:
@@ -20,6 +20,12 @@
 #include <SPIFFS.h>
 #include "esp_arduino_version.h"  // add this near your other includes
 #include "esp_wifi.h"
+#include "esp_system.h"
+#include "mbedtls/base64.h"
+#include "mbedtls/gcm.h"
+#include "mbedtls/md.h"
+#include "mbedtls/pkcs5.h"
+#include "mbedtls/sha256.h"
 
 #if __has_include("esp_wifi_ap_get_sta_list.h")
   #include "esp_wifi_ap_get_sta_list.h"
@@ -39,7 +45,7 @@
 struct SessionLoc;
 
 // ---------- User Config ----------
-static const char* AP_SSID = "PUBLIC-NODE";
+static const char* AP_SSID = "SOLARNODE";
 
 // LED blink behavior
 static const uint32_t BLINK_PERIOD_MS = 500;     // full cycle = 500ms (250ms on, 250ms off)
@@ -51,15 +57,18 @@ static const uint8_t  HALF_DUTY       = 51;      // ~20% of 255 (255*0.20=51)
 
 // Storage limits
 static const size_t MAX_DEVICES  = 100;
-static const size_t MAX_MESSAGES = 25;
-static const size_t MAX_MSG_LEN  = 160;
+static const size_t MAX_TOPICS   = 50;
+static const size_t MAX_POSTS_PER_TOPIC = 200;
+static const size_t MAX_TITLE_LEN = 80;
+static const size_t MAX_BODY_LEN  = 500;
 
 // Files in SPIFFS
 static const char* DEVICES_FILE  = "/devices.csv";   // mac,count,lastSeenMs
 // Files in SPIFFS (v2 formats)
 static const char* USERS_FILE    = "/users.csv";         // mac,username
 static const char* NODELOC_FILE  = "/node_location.csv"; // lat,lon,acc,reported_by_mac,last_ms
-static const char* MESSAGES_FILE = "/messages_v2.log";   // t|mac|user|lat|lon|acc|msg  (pipe-delimited)
+static const char* SECRET_FILE   = "/secret.bin";        // 32 bytes device secret
+static const char* TOPICS_FILE   = "/topics.idx";        // topic index
 
 // Username limits
 static const size_t MAX_NAME_LEN = 24;
@@ -111,6 +120,120 @@ String jsonEscape(const String& s) {
   return out;
 }
 
+static uint8_t deviceSecret[32];
+static bool secretLoaded = false;
+
+bool loadSecret() {
+  if (secretLoaded) return true;
+  if (SPIFFS.exists(SECRET_FILE)) {
+    File f = SPIFFS.open(SECRET_FILE, FILE_READ);
+    if (f) {
+      size_t n = f.readBytes((char*)deviceSecret, sizeof(deviceSecret));
+      f.close();
+      if (n == sizeof(deviceSecret)) {
+        secretLoaded = true;
+        return true;
+      }
+    }
+  }
+
+  for (size_t i = 0; i < sizeof(deviceSecret); i += 4) {
+    uint32_t r = esp_random();
+    size_t remain = sizeof(deviceSecret) - i;
+    size_t copyLen = remain >= 4 ? 4 : remain;
+    memcpy(deviceSecret + i, &r, copyLen);
+  }
+
+  File wf = SPIFFS.open(SECRET_FILE, FILE_WRITE);
+  if (wf) {
+    wf.write(deviceSecret, sizeof(deviceSecret));
+    wf.close();
+  }
+  secretLoaded = true;
+  return true;
+}
+
+const uint8_t* getSecret() {
+  if (!secretLoaded) loadSecret();
+  return deviceSecret;
+}
+
+bool base64Encode(const uint8_t* in, size_t inLen, String& out) {
+  size_t outLen = 4 * ((inLen + 2) / 3) + 4;
+  char* buf = (char*)malloc(outLen + 1);
+  if (!buf) return false;
+  size_t olen = 0;
+  int rc = mbedtls_base64_encode((unsigned char*)buf, outLen, &olen, in, inLen);
+  if (rc != 0) {
+    free(buf);
+    return false;
+  }
+  buf[olen] = 0;
+  out = String(buf);
+  free(buf);
+  return true;
+}
+
+bool base64Decode(const String& in, uint8_t** outBuf, size_t* outLen) {
+  size_t bufLen = (in.length() * 3) / 4 + 4;
+  uint8_t* buf = (uint8_t*)malloc(bufLen);
+  if (!buf) return false;
+  size_t olen = 0;
+  int rc = mbedtls_base64_decode(buf, bufLen, &olen,
+                                 (const unsigned char*)in.c_str(), in.length());
+  if (rc != 0) {
+    free(buf);
+    return false;
+  }
+  *outBuf = buf;
+  *outLen = olen;
+  return true;
+}
+
+String base64UrlFromBytes(const uint8_t* in, size_t len) {
+  String b64;
+  if (!base64Encode(in, len, b64)) return "";
+  b64.replace("+", "-");
+  b64.replace("/", "_");
+  while (b64.endsWith("=")) b64.remove(b64.length() - 1);
+  return b64;
+}
+
+String anonymizeKey(const String& key) {
+  if (!key.length() || key == "UNKNOWN") return "unknown";
+  const uint8_t* secret = getSecret();
+  uint8_t hash[32];
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+  mbedtls_sha256_update(&ctx, secret, sizeof(deviceSecret));
+  mbedtls_sha256_update(&ctx, (const unsigned char*)key.c_str(), key.length());
+  mbedtls_sha256_finish(&ctx, hash);
+  mbedtls_sha256_free(&ctx);
+
+  String id = base64UrlFromBytes(hash, 6);
+  if (id.length() > 10) id = id.substring(0, 10);
+  return id;
+}
+
+String displayNameFor(const String& user, const String& authorId) {
+  if (user.length()) return user;
+  return String("anon-") + authorId;
+}
+
+bool isSafeTopicId(const String& id) {
+  if (!id.length() || id.length() > 16) return false;
+  for (size_t i = 0; i < id.length(); i++) {
+    char c = id[i];
+    bool ok = (c >= 'a' && c <= 'z') ||
+              (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') ||
+              c == '_' || c == '-';
+    if (!ok) return false;
+  }
+  return true;
+}
+
 struct UserEntry {
   String mac;
   String name;
@@ -135,6 +258,21 @@ struct SessionLoc {
 
 static SessionLoc sessionLocs[MAX_DEVICES];
 static size_t sessionLocCount = 0;
+
+struct TopicMeta {
+  String id;
+  uint32_t createdMs = 0;
+  uint32_t lastMs = 0;
+  uint32_t replyCount = 0;
+  String creatorId;
+  bool encrypted = false;
+  String title;
+  String saltB64;
+  String nonceB64;
+};
+
+static TopicMeta topics[MAX_TOPICS];
+static size_t topicCount = 0;
 
 String sanitizeField(String s, size_t maxLen) {
   s.replace("\r", " ");
@@ -313,36 +451,100 @@ String clientMacFromRequest() {
   return "UNKNOWN";
 }
 
-// ---- Messages v2: t|mac|user|lat|lon|acc|msg ----
-void appendMessageV2(const String& mac, const String& user, bool hasLoc, float lat, float lon, float acc, const String& msgRaw) {
-  String msg = sanitizeField(msgRaw, MAX_MSG_LEN);
-  if (!msg.length()) return;
+String topicFilePath(const String& id) {
+  return String("/t_") + id + ".log";
+}
 
-  String u = sanitizeField(user, MAX_NAME_LEN);
-
-  if (!SPIFFS.exists(MESSAGES_FILE)) {
-    File nf = SPIFFS.open(MESSAGES_FILE, FILE_WRITE);
-    if (nf) nf.close();
+int findTopicIndex(const String& id) {
+  for (size_t i = 0; i < topicCount; i++) {
+    if (topics[i].id == id) return (int)i;
   }
+  return -1;
+}
 
-  File f = SPIFFS.open(MESSAGES_FILE, FILE_APPEND);
+bool splitTopicLine(const String& line, String out[9]) {
+  int start = 0;
+  for (int i = 0; i < 8; i++) {
+    int p = line.indexOf('|', start);
+    if (p < 0) return false;
+    out[i] = line.substring(start, p);
+    start = p + 1;
+  }
+  out[8] = line.substring(start);
+  return true;
+}
+
+void saveTopicsIndex() {
+  File f = SPIFFS.open(TOPICS_FILE, FILE_WRITE);
   if (!f) return;
-
-  uint32_t t = millis();
-  f.print(t); f.print("|");
-  f.print(mac); f.print("|");
-  f.print(u); f.print("|");
-  if (hasLoc) {
-    f.print(String(lat, 6)); f.print("|");
-    f.print(String(lon, 6)); f.print("|");
-    f.print(String(acc, 1)); f.print("|");
-  } else {
-    f.print("|"); f.print("|"); f.print("|");
+  for (size_t i = 0; i < topicCount; i++) {
+    TopicMeta& t = topics[i];
+    f.print(t.id); f.print("|");
+    f.print(t.createdMs); f.print("|");
+    f.print(t.lastMs); f.print("|");
+    f.print(t.replyCount); f.print("|");
+    f.print(t.creatorId); f.print("|");
+    f.print(t.encrypted ? "1" : "0"); f.print("|");
+    f.print(t.title); f.print("|");
+    f.print(t.saltB64); f.print("|");
+    f.println(t.nonceB64);
   }
-  f.println(msg);
   f.close();
+}
 
-  trimMessagesIfNeeded(); // keep your existing trimming routine (it counts lines)
+void loadTopicsIndex() {
+  topicCount = 0;
+  if (!SPIFFS.exists(TOPICS_FILE)) {
+    File nf = SPIFFS.open(TOPICS_FILE, FILE_WRITE);
+    if (nf) nf.close();
+    return;
+  }
+  File f = SPIFFS.open(TOPICS_FILE, FILE_READ);
+  if (!f) return;
+  while (f.available() && topicCount < MAX_TOPICS) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (!line.length()) continue;
+    String parts[9];
+    if (!splitTopicLine(line, parts)) continue;
+    TopicMeta& t = topics[topicCount++];
+    t.id = parts[0];
+    t.createdMs = (uint32_t)parts[1].toInt();
+    t.lastMs = (uint32_t)parts[2].toInt();
+    t.replyCount = (uint32_t)parts[3].toInt();
+    t.creatorId = parts[4];
+    t.encrypted = parts[5].toInt() == 1;
+    t.title = parts[6];
+    t.saltB64 = parts[7];
+    t.nonceB64 = parts[8];
+  }
+  f.close();
+}
+
+String generateTopicId() {
+  String id;
+  for (int tries = 0; tries < 5; tries++) {
+    uint32_t r = esp_random();
+    id = String(r, HEX);
+    id.toLowerCase();
+    if (findTopicIndex(id) < 0) return id;
+  }
+  id = String(millis(), HEX);
+  id.toLowerCase();
+  return id;
+}
+
+void trimTopicsIfNeeded() {
+  if (topicCount < MAX_TOPICS) return;
+  size_t oldest = 0;
+  for (size_t i = 1; i < topicCount; i++) {
+    if (topics[i].lastMs < topics[oldest].lastMs) oldest = i;
+  }
+  String path = topicFilePath(topics[oldest].id);
+  if (SPIFFS.exists(path)) SPIFFS.remove(path);
+  for (size_t i = oldest + 1; i < topicCount; i++) topics[i - 1] = topics[i];
+  if (topicCount > 0) topicCount--;
+  saveTopicsIndex();
 }
 
 int findDeviceIndex(const String& mac) {
@@ -442,16 +644,15 @@ size_t countLinesInFile(const char* path) {
   return lines;
 }
 
-void trimMessagesIfNeeded() {
-  size_t lines = countLinesInFile(MESSAGES_FILE);
-  if (lines <= MAX_MESSAGES) return;
+void trimPostsIfNeeded(const String& topicId) {
+  String path = topicFilePath(topicId);
+  size_t lines = countLinesInFile(path.c_str());
+  if (lines <= MAX_POSTS_PER_TOPIC) return;
 
-  // Keep only the last MAX_MESSAGES lines
-  File f = SPIFFS.open(MESSAGES_FILE, FILE_READ);
+  File f = SPIFFS.open(path, FILE_READ);
   if (!f) return;
 
-  // Read all into a ring buffer of Strings
-  String ring[MAX_MESSAGES];
+  String ring[MAX_POSTS_PER_TOPIC];
   size_t idx = 0;
   size_t total = 0;
 
@@ -459,43 +660,166 @@ void trimMessagesIfNeeded() {
     String line = f.readStringUntil('\n');
     line.trim();
     ring[idx] = line;
-    idx = (idx + 1) % MAX_MESSAGES;
+    idx = (idx + 1) % MAX_POSTS_PER_TOPIC;
     total++;
   }
   f.close();
 
-  File w = SPIFFS.open(MESSAGES_FILE, FILE_WRITE);
+  File w = SPIFFS.open(path, FILE_WRITE);
   if (!w) return;
 
-  size_t start = (total >= MAX_MESSAGES) ? idx : 0;
-  size_t count = (total >= MAX_MESSAGES) ? MAX_MESSAGES : total;
+  size_t start = (total >= MAX_POSTS_PER_TOPIC) ? idx : 0;
+  size_t count = (total >= MAX_POSTS_PER_TOPIC) ? MAX_POSTS_PER_TOPIC : total;
 
   for (size_t i = 0; i < count; i++) {
-    size_t j = (start + i) % MAX_MESSAGES;
+    size_t j = (start + i) % MAX_POSTS_PER_TOPIC;
     if (ring[j].length() > 0) w.println(ring[j]);
   }
   w.close();
 }
 
-void appendMessage(const String& rawMsg) {
-  String msg = rawMsg;
-  msg.replace("\r", " ");
-  msg.replace("\n", " ");
-  msg.trim();
-  if (msg.length() == 0) return;
-  if (msg.length() > MAX_MSG_LEN) msg = msg.substring(0, MAX_MSG_LEN);
+bool deriveKeyFromPassword(const String& password, const uint8_t* salt, size_t saltLen, uint8_t outKey[32]) {
+  int rc = mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256,
+                                        (const unsigned char*)password.c_str(), password.length(),
+                                        salt, saltLen,
+                                        100000, 32, outKey);
+  return rc == 0;
+}
 
-  if (!SPIFFS.exists(MESSAGES_FILE)) {
-    File nf = SPIFFS.open(MESSAGES_FILE, FILE_WRITE);
-    if (nf) nf.close();
+bool encryptWithPassword(const String& password, const String& saltB64, const String& plaintext, String& outPayload) {
+  uint8_t* salt = nullptr;
+  size_t saltLen = 0;
+  if (!base64Decode(saltB64, &salt, &saltLen) || saltLen == 0) return false;
+
+  uint8_t key[32];
+  if (!deriveKeyFromPassword(password, salt, saltLen, key)) {
+    free(salt);
+    return false;
+  }
+  free(salt);
+
+  uint8_t nonce[12];
+  for (size_t i = 0; i < sizeof(nonce); i += 4) {
+    uint32_t r = esp_random();
+    memcpy(nonce + i, &r, (sizeof(nonce) - i >= 4) ? 4 : (sizeof(nonce) - i));
   }
 
-  File f = SPIFFS.open(MESSAGES_FILE, FILE_APPEND);
+  size_t ptLen = plaintext.length();
+  size_t ctLen = ptLen + 16;
+  uint8_t* ct = (uint8_t*)malloc(ctLen);
+  if (!ct) return false;
+
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  int rc = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 256);
+  if (rc == 0) {
+    rc = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT,
+                                   ptLen,
+                                   nonce, sizeof(nonce),
+                                   nullptr, 0,
+                                   (const unsigned char*)plaintext.c_str(),
+                                   ct,
+                                   16, ct + ptLen);
+  }
+  mbedtls_gcm_free(&gcm);
+
+  if (rc != 0) {
+    free(ct);
+    return false;
+  }
+
+  String nonceB64;
+  String ctB64;
+  bool ok = base64Encode(nonce, sizeof(nonce), nonceB64) && base64Encode(ct, ctLen, ctB64);
+  free(ct);
+  if (!ok) return false;
+
+  outPayload = nonceB64 + ":" + ctB64;
+  return true;
+}
+
+bool decryptWithPassword(const String& password, const String& saltB64, const String& payload, String& outPlain) {
+  int sep = payload.indexOf(':');
+  if (sep < 0) return false;
+  String nonceB64 = payload.substring(0, sep);
+  String ctB64 = payload.substring(sep + 1);
+
+  uint8_t* salt = nullptr;
+  size_t saltLen = 0;
+  if (!base64Decode(saltB64, &salt, &saltLen) || saltLen == 0) return false;
+
+  uint8_t key[32];
+  if (!deriveKeyFromPassword(password, salt, saltLen, key)) {
+    free(salt);
+    return false;
+  }
+  free(salt);
+
+  uint8_t* nonce = nullptr;
+  size_t nonceLen = 0;
+  if (!base64Decode(nonceB64, &nonce, &nonceLen) || nonceLen != 12) {
+    if (nonce) free(nonce);
+    return false;
+  }
+
+  uint8_t* ct = nullptr;
+  size_t ctLen = 0;
+  if (!base64Decode(ctB64, &ct, &ctLen) || ctLen < 16) {
+    free(nonce);
+    if (ct) free(ct);
+    return false;
+  }
+
+  size_t ptLen = ctLen - 16;
+  uint8_t* pt = (uint8_t*)malloc(ptLen + 1);
+  if (!pt) {
+    free(nonce);
+    free(ct);
+    return false;
+  }
+
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  int rc = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 256);
+  if (rc == 0) {
+    rc = mbedtls_gcm_auth_decrypt(&gcm, ptLen,
+                                  nonce, nonceLen,
+                                  nullptr, 0,
+                                  ct + ptLen, 16,
+                                  ct, pt);
+  }
+  mbedtls_gcm_free(&gcm);
+  free(nonce);
+  free(ct);
+
+  if (rc != 0) {
+    free(pt);
+    return false;
+  }
+
+  pt[ptLen] = 0;
+  outPlain = String((char*)pt);
+  free(pt);
+  return true;
+}
+
+void appendPost(const String& topicId, const String& authorId, const String& username,
+                bool encrypted, const String& payload) {
+  String path = topicFilePath(topicId);
+  File f = SPIFFS.open(path, FILE_APPEND);
   if (!f) return;
-  f.println(msg);
+
+  uint32_t t = millis();
+  String user = sanitizeField(username, MAX_NAME_LEN);
+
+  f.print(t); f.print("|");
+  f.print(authorId); f.print("|");
+  f.print(user); f.print("|");
+  f.print(encrypted ? "1" : "0"); f.print("|");
+  f.println(payload);
   f.close();
 
-  trimMessagesIfNeeded();
+  trimPostsIfNeeded(topicId);
 }
 
 // ---------- Captive Portal / Web UI ----------
@@ -503,195 +827,613 @@ String pageHtml() {
   String ip = WiFi.softAPIP().toString();
 
   String html;
-  html.reserve(5000);
-  html += F(
-    "<!doctype html><html><head>"
-    "<meta charset='utf-8'/>"
-    "<meta name='viewport' content='width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover'/>"
-    "<meta name='apple-mobile-web-app-capable' content='yes'/>"
-    "<title>PUBLIC-NODE</title>"
-    "<style>"
-    "html,body{touch-action:pan-x pan-y;overscroll-behavior:none}"
-    "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:16px;max-width:900px}"
-    ".card{border:1px solid #ddd;border-radius:12px;padding:14px;margin:12px 0}"
-    "h1{margin:0 0 6px 0;font-size:22px}"
-    "small{color:#555}"
-    "table{width:100%;border-collapse:collapse}"
-    "th,td{border-bottom:1px solid #eee;padding:8px;text-align:left;font-size:14px}"
-    "th{background:#fafafa}"
-    ".muted{color:#666}"
-    ".row{display:flex;gap:12px;flex-wrap:wrap}"
-    ".col{flex:1;min-width:260px}"
-    "input[type=text]{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccc;border-radius:10px;font-size:14px}"
-    "button{padding:10px 12px;border:0;border-radius:10px;background:#111;color:#fff;font-size:14px;cursor:pointer}"
-    "button:active{transform:translateY(1px)}"
-    "pre{white-space:pre-wrap;word-break:break-word;background:#f7f7f7;padding:10px;border-radius:10px}"
-    "</style>"
-    "</head><body>"
-  );
+  html.reserve(15000);
+  html += R"rawliteral(
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <title>SOLARNODE Forum</title>
+  <style>
+    :root{--bg1:#4c5844;--bg2:#3f4738;--card:#3f4738;--ink:#eff6ee;--muted:#d7e2d2;--accent:#968732;--accent2:#968732}
+    *{box-sizing:border-box}
+    html,body{touch-action:pan-x pan-y;overscroll-behavior:none}
+    body{margin:0;padding:16px;min-height:100dvh;font-family:"Fira Sans","Segoe UI",sans-serif;color:var(--ink);background:radial-gradient(1200px 600px at 20% -10%,#5a6a52,transparent),linear-gradient(180deg,var(--bg1),var(--bg2))}
+    h1{margin:0 0 6px 0;font-size:22px;letter-spacing:0.5px}
+    h2{margin:0 0 10px 0;font-size:18px}
+    small{color:var(--muted)}
+    .wrap{max-width:980px;margin:0 auto}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    .tabs{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+    .tabbtn{padding:8px 12px;border-radius:999px;border:1px solid #1f2937;background:#0b1222;color:var(--ink);cursor:pointer;font-size:13px}
+    .tabbtn.active{background:var(--accent);color:#2f361f;border-color:var(--accent)}
+    .tabview{display:block}
+    .card{background:rgba(15,23,42,0.9);border:1px solid #1f2937;border-radius:14px;padding:14px;margin:12px 0;box-shadow:0 10px 30px rgba(2,6,23,0.35)}
+    .muted{color:var(--muted)}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#111827;color:#cbd5f5;font-size:12px}
+    .btn{padding:10px 12px;border:0;border-radius:10px;background:#111827;color:#e2e8f0;font-size:14px;cursor:pointer}
+    .btn.primary{background:var(--accent);color:#0b1020;font-weight:700}
+    .btn.warn{background:var(--accent2);color:#111827}
+    .btn:active{transform:translateY(1px)}
+    input[type=text],textarea,input[type=password]{width:100%;padding:10px;border:1px solid #1f2937;border-radius:10px;background:#0b1222;color:#e2e8f0;font-size:14px}
+    textarea{min-height:120px;resize:vertical}
+    .topics{display:flex;flex-direction:column;gap:8px}
+    .topic{display:flex;gap:12px;align-items:center;justify-content:space-between;padding:10px 12px;border:1px solid #1f2937;border-radius:12px;background:#0b1222;cursor:pointer}
+    .topic:hover{border-color:#334155}
+    .topic .title{font-size:15px;font-weight:700}
+    .topic .meta{font-size:12px;color:var(--muted)}
+    .tag{font-size:11px;color:#2f361f;background:var(--accent);padding:2px 6px;border-radius:6px}
+    .posts{display:flex;flex-direction:column;gap:10px}
+    .post{padding:12px;border:1px solid #1f2937;border-radius:12px;background:#0b1222}
+    .post .who{font-weight:700}
+    .post .time{color:var(--muted);font-size:12px}
+    .modal{position:fixed;inset:0;background:rgba(2,6,23,0.75);display:flex;align-items:center;justify-content:center;padding:16px}
+    .modal.hidden{display:none}
+    .hidden{display:none}
+    .modal .box{max-width:420px;width:100%;background:#0b1222;border:1px solid #1f2937;border-radius:14px;padding:16px}
+    .split{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .notice{font-size:12px;color:#fbbf24}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>SOLARNODE</h1>
+    <small>Captive portal @ <b>)rawliteral";
+  html += ip;
+  html += R"rawliteral(</b> (open network)</small>
 
-  html += "<h1>PUBLIC-NODE</h1>";
-  html += "<small>Captive portal @ <b>" + ip + "</b> (open network)</small>";
+    <div class="tabs">
+      <button id="tabForum" class="tabbtn active">Forum</button>
+      <button id="tabProfile" class="tabbtn">Profile</button>
+      <button id="tabMetrics" class="tabbtn">Metrics</button>
+    </div>
 
-  html += F("<div class='row'>");
+    <div id="viewForum" class="tabview">
+      <div class="card">
+        <div class="split" style="justify-content:space-between">
+          <h2>Forum</h2>
+          <div class="split">
+            <button id="btnTopics" class="btn">Topics</button>
+            <button id="btnNew" class="btn primary">New Topic</button>
+          </div>
+        </div>
 
-  // Metrics
-  html += F("<div class='card col'>"
-            "<h2 style='margin:0 0 8px 0;font-size:18px'>Metrics</h2>"
-            "<div class='muted'>Known devices (ever connected): <span id='knownCount'>...</span><br/>"
-            "Currently connected (approx): <span id='curCount'>...</span></div>"
-            "<div style='margin-top:10px;overflow:auto;max-height:320px'>"
-            "<table><thead><tr><th>MAC</th><th>Count</th><th>Last Seen (ms since boot)</th></tr></thead>"
-            "<tbody id='devRows'><tr><td colspan='3' class='muted'>Loading…</td></tr></tbody>"
-            "</table></div>"
-            "</div>");
+        <div id="topicsView">
+          <div class="topics" id="topicsList">Loading...</div>
+        </div>
 
-  // Chat
-html += F("<div class='card col'>"
-          "<h2 style='margin:0 0 8px 0;font-size:18px'>Chat</h2>"
+        <div id="threadView" class="hidden">
+          <div class="split" style="justify-content:space-between;margin-bottom:10px">
+            <div>
+              <div class="title" id="threadTitle" style="font-weight:800;font-size:18px"></div>
+              <div class="muted" id="threadMeta"></div>
+            </div>
+            <div class="split">
+              <button id="btnUnlock" class="btn warn hidden">Unlock</button>
+              <button id="btnBack" class="btn">Back to Topics</button>
+            </div>
+          </div>
+          <div id="posts" class="posts"></div>
+          <div class="split" style="justify-content:flex-end;margin-top:12px">
+            <button id="btnReply" class="btn primary">Reply</button>
+          </div>
+        </div>
+      </div>
+    </div>
 
-          "<div class='muted'>Your device: <span id='meMac'>…</span></div>"
-          "<div style='display:flex;gap:8px;margin-top:8px'>"
-            "<input id='name' type='text' maxlength='24' placeholder='Username (saved per device)'/>"
-            "<button id='saveName' type='button'>Save</button>"
-          "</div>"
+    <div id="viewProfile" class="tabview hidden">
+      <div class="card">
+        <h2>Profile</h2>
+        <div class="muted">You: <span id="meName">...</span> <span class="pill" id="meId">...</span></div>
+        <div class="split" style="margin-top:10px">
+          <button id="btnSetName" class="btn">Set Name</button>
+        </div>
+        <div class="muted" style="margin-top:10px">Node location: <span id="nodeLoc">(unknown)</span></div>
+        <div class="split" style="margin-top:8px">
+          <button id="shareLoc" class="btn">Share GPS</button>
+          <span class="muted" id="cryptoState">...</span>
+        </div>
+      </div>
+    </div>
 
-          "<div class='muted' style='margin-top:10px'>"
-            "Node location: <span id='nodeLoc'>(unknown)</span>"
-          "</div>"
-          "<div style='display:flex;justify-content:flex-end;margin-top:8px'>"
-            "<button id='shareLoc' type='button'>Share GPS</button>"
-          "</div>"
+    <div id="viewMetrics" class="tabview hidden">
+      <div class="card">
+        <h2>Metrics</h2>
+        <div class="muted">Known devices: <span id="knownCount">...</span></div>
+        <div class="muted">Currently connected: <span id="curCount">...</span></div>
+        <div style="margin-top:10px;max-height:240px;overflow:auto" id="devicesList" class="muted">Loading...</div>
+      </div>
+    </div>
+  </div>
 
-          "<form id='chatForm' style='margin-top:10px'>"
-            "<input id='msg' type='text' name='msg' maxlength='160' placeholder='Type a short message…'/>"
-            "<div style='display:flex;justify-content:flex-end;margin-top:10px'>"
-              "<button type='submit'>Send</button>"
-            "</div>"
-          "</form>"
+  <div id="modal" class="modal hidden">
+    <div class="box">
+      <div id="modalTitle" style="font-weight:800;font-size:16px;margin-bottom:6px">Modal</div>
+      <div id="modalText" class="muted" style="margin-bottom:8px"></div>
+      <input id="modalName" type="text" maxlength="24" placeholder="Username" class="hidden"/>
+      <input id="modalTopicTitle" type="text" maxlength="80" placeholder="Topic title" class="hidden"/>
+      <textarea id="modalBody" maxlength="500" placeholder="Write here..." class="hidden"></textarea>
+      <label id="modalEncryptedWrap" class="muted hidden" style="display:block;margin-top:6px">
+        <input id="modalEncrypted" type="checkbox"/> Encrypted topic
+      </label>
+      <input id="modalPassword" type="password" placeholder="Password" class="hidden"/>
+      <div class="notice" id="modalWarn" style="margin-top:6px"></div>
+      <div class="split" style="justify-content:flex-end;margin-top:12px">
+        <button id="modalCancel" class="btn">Cancel</button>
+        <button id="modalOk" class="btn primary">OK</button>
+      </div>
+    </div>
+  </div>
 
-          "<div style='margin-top:12px'>"
-          "<div class='muted' style='margin-bottom:6px'>Recent messages</div>"
-          "<pre id='msgs'>Loading…</pre>"
-          "</div></div>");
+  <script>
+    const $=id=>document.getElementById(id);
+    const cryptoOk=!!(window.crypto && window.crypto.subtle);
+    const state={me:null,topics:[],topic:null,passwords:{},decrypted:{},modalMode:""};
 
-  html += F("</div>"); // row
+    document.addEventListener('gesturestart',e=>e.preventDefault(),{passive:false});
+    document.addEventListener('gesturechange',e=>e.preventDefault(),{passive:false});
+    document.addEventListener('gestureend',e=>e.preventDefault(),{passive:false});
+    let lastTouchEnd=0;
+    document.addEventListener('touchend',e=>{const now=Date.now();if(now-lastTouchEnd<=300)e.preventDefault();lastTouchEnd=now;},{passive:false});
+    document.addEventListener('wheel',e=>{if(e.ctrlKey||e.metaKey)e.preventDefault();},{passive:false});
 
-  html += F(
-  "<script>"
+    function bytesToB64(bytes){
+      let bin="";
+      for(let i=0;i<bytes.length;i++) bin+=String.fromCharCode(bytes[i]);
+      return btoa(bin);
+    }
+    function b64ToBytes(b64){
+      const bin=atob(b64);
+      const bytes=new Uint8Array(bin.length);
+      for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+      return bytes;
+    }
 
-  // --- No zoom / no pinch / no double-tap ---
-  "document.addEventListener('gesturestart',function(e){e.preventDefault();},{passive:false});"
-  "document.addEventListener('gesturechange',function(e){e.preventDefault();},{passive:false});"
-  "document.addEventListener('gestureend',function(e){e.preventDefault();},{passive:false});"
-  "let lastTouchEnd=0;"
-  "document.addEventListener('touchend',function(e){const now=Date.now();if(now-lastTouchEnd<=300){e.preventDefault();}lastTouchEnd=now;},{passive:false});"
-  "document.addEventListener('wheel',function(e){if(e.ctrlKey||e.metaKey)e.preventDefault();},{passive:false});"
+    async function deriveKey(password, saltB64){
+      const enc=new TextEncoder();
+      const keyMaterial=await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
+      const salt=b64ToBytes(saltB64);
+      return crypto.subtle.deriveKey(
+        {name:"PBKDF2", salt, iterations:100000, hash:"SHA-256"},
+        keyMaterial,
+        {name:"AES-GCM", length:256},
+        false,
+        ["encrypt","decrypt"]
+      );
+    }
 
-  "const $=id=>document.getElementById(id);"
+    async function encryptText(password, saltB64, text){
+      const key=await deriveKey(password, saltB64);
+      const iv=crypto.getRandomValues(new Uint8Array(12));
+      const enc=new TextEncoder();
+      const ct=await crypto.subtle.encrypt({name:"AES-GCM", iv}, key, enc.encode(text));
+      return bytesToB64(iv)+":"+bytesToB64(new Uint8Array(ct));
+    }
 
-  "async function post(url, obj){"
-    "const body=new URLSearchParams(obj);"
-    "return fetch(url,{method:'POST',headers:{"
-      "'Content-Type':'application/x-www-form-urlencoded',"
-      "'X-Requested-With':'fetch'"
-    "},body});"
-  "}"
+    async function decryptPayload(password, saltB64, payload){
+      const parts=payload.split(":");
+      if(parts.length<2) return "";
+      const iv=b64ToBytes(parts[0]);
+      const ct=b64ToBytes(parts[1]);
+      const key=await deriveKey(password, saltB64);
+      const pt=await crypto.subtle.decrypt({name:"AES-GCM", iv}, key, ct);
+      return new TextDecoder().decode(pt);
+    }
 
-  "function renderNodeLoc(n){"
-    "if(!n){$('nodeLoc').textContent='(unknown)'; return;}"
-    "const s=`${n.lat.toFixed(6)}, ${n.lon.toFixed(6)} (±${n.acc.toFixed(1)}m) by ${n.by_mac}`;"
-    "$('nodeLoc').textContent=s;"
-  "}"
+    async function apiGet(url){
+      try{
+        const r=await fetch(url,{cache:"no-store"});
+        return await r.json();
+      }catch(e){
+        return {ok:false, err:"fetch_failed"};
+      }
+    }
+    async function apiPost(url, obj){
+      const body=new URLSearchParams(obj);
+      try{
+        const r=await fetch(url,{method:"POST",headers:{
+          "Content-Type":"application/x-www-form-urlencoded",
+          "X-Requested-With":"fetch"
+        },body});
+        return await r.json();
+      }catch(e){
+        return {ok:false, err:"fetch_failed"};
+      }
+    }
 
-  "async function loadMe(){"
-    "try{"
-      "const r=await fetch('/me',{cache:'no-store'});"
-      "const me=await r.json();"
-      "$('meMac').textContent=me.mac || 'UNKNOWN';"
-      "$('name').value=me.username || '';"
-      "renderNodeLoc(me.node_location);"
-    "}catch(e){console.log(e);}"
-  "}"
+    function setView(view){
+      $("topicsView").classList.add("hidden");
+      $("threadView").classList.add("hidden");
+      $(view).classList.remove("hidden");
+    }
 
-  "async function saveName(){"
-    "const name=$('name').value.trim();"
-    "if(!name) return;"
-    "try{ await post('/setname',{name}); }catch(e){console.log(e);}"
-  "}"
+    function setTab(tab){
+      $("viewForum").classList.add("hidden");
+      $("viewProfile").classList.add("hidden");
+      $("viewMetrics").classList.add("hidden");
+      $("tabForum").classList.remove("active");
+      $("tabProfile").classList.remove("active");
+      $("tabMetrics").classList.remove("active");
 
-  "async function shareLoc(){"
-    "if(!navigator.geolocation){ alert('Geolocation not available'); return; }"
-    "navigator.geolocation.getCurrentPosition(async (pos)=>{"
-      "const lat=pos.coords.latitude;"
-      "const lon=pos.coords.longitude;"
-      "const acc=pos.coords.accuracy || 0;"
-      "try{ await post('/setloc',{lat:String(lat),lon:String(lon),acc:String(acc)}); }catch(e){console.log(e);}"
-      "await loadMe();"
-    "}, (err)=>{"
-      "console.log(err);"
-      "alert('Location permission denied or unavailable');"
-    "}, {enableHighAccuracy:true, timeout:8000, maximumAge:0});"
-  "}"
+      if(tab==="profile"){
+        $("viewProfile").classList.remove("hidden");
+        $("tabProfile").classList.add("active");
+      }else if(tab==="metrics"){
+        $("viewMetrics").classList.remove("hidden");
+        $("tabMetrics").classList.add("active");
+      }else{
+        $("viewForum").classList.remove("hidden");
+        $("tabForum").classList.add("active");
+      }
+    }
 
-  "async function refresh(){"
-    "try{"
-      "const r=await fetch('/data',{cache:'no-store'});"
-      "const j=await r.json();"
-      "document.getElementById('knownCount').textContent=j.known_devices.length;"
-      "document.getElementById('curCount').textContent=j.current_stations;"
-      "const tb=document.getElementById('devRows');"
-      "tb.innerHTML='';"
-      "if(j.known_devices.length===0){"
-        "tb.innerHTML='<tr><td colspan=3 class=muted>No devices yet.</td></tr>';"
-      "}else{"
-        "for(const d of j.known_devices){"
-          "const tr=document.createElement('tr');"
-          "tr.innerHTML=`<td>${d.mac}</td><td>${d.count}</td><td>${d.last_seen_ms}</td>`;"
-          "tb.appendChild(tr);"
-        "}"
-      "}"
+    function formatMs(ms){
+      if(ms===null || ms===undefined) return "";
+      return ms + " ms since boot";
+    }
 
-      // messages as objects
-      "if(!j.messages || !j.messages.length){"
-        "$('msgs').textContent='(no messages yet)';"
-      "}else{"
-        "const lines=j.messages.map(m=>{"
-          "const who=(m.user && m.user.length)?m.user:'anon';"
-          "const loc=(m.lat!=null && m.lon!=null)?` @ ${Number(m.lat).toFixed(5)},${Number(m.lon).toFixed(5)} (±${Number(m.acc||0).toFixed(0)}m)`:'';"
-          "return `${who} (${m.mac})${loc}: ${m.msg}`;"
-        "});"
-        "$('msgs').textContent=lines.join('\\n');"
-      "}"
-    "}catch(e){console.log(e);}"
-  "}"
+    function renderNodeLoc(n){
+      if(!n){$("nodeLoc").textContent="(unknown)"; return;}
+      const s=`${n.lat.toFixed(6)}, ${n.lon.toFixed(6)} (+/-${n.acc.toFixed(1)}m) by ${n.by_id}`;
+      $("nodeLoc").textContent=s;
+    }
 
-  "document.addEventListener('DOMContentLoaded', async ()=>{"
-    "await loadMe();"
-    "await refresh();"
-    "setInterval(refresh, 5000);"
+    async function loadMe(){
+      try{
+        const me=await apiGet("/me");
+        state.me=me;
+        $("meName").textContent=me.username || "anon";
+        $("meId").textContent=me.anonymized_id || "unknown";
+        renderNodeLoc(me.node_location);
+      }catch(e){}
+    }
 
-    // request GPS once on load (will prompt on many devices)
-    "setTimeout(()=>{ try{ shareLoc(); }catch(e){} }, 600);"
+    async function saveName(name){
+      const clean=(name||"").trim();
+      if(!clean) return;
+      await apiPost("/setname",{name:clean});
+      await loadMe();
+    }
 
-    "$('saveName').addEventListener('click', saveName);"
-    "$('shareLoc').addEventListener('click', shareLoc);"
+    async function shareLoc(){
+      if(!navigator.geolocation){ alert("Geolocation not available"); return; }
+      navigator.geolocation.getCurrentPosition(async (pos)=>{
+        const lat=pos.coords.latitude;
+        const lon=pos.coords.longitude;
+        const acc=pos.coords.accuracy || 0;
+        await apiPost("/setloc",{lat:String(lat),lon:String(lon),acc:String(acc)});
+        await loadMe();
+      }, ()=>{ alert("Location permission denied or unavailable"); },
+      {enableHighAccuracy:true, timeout:8000, maximumAge:0});
+    }
 
-    "$('chatForm').addEventListener('submit', async (e)=>{"
-      "e.preventDefault();"
-      "await saveName();"
-      "const msg=$('msg').value.trim();"
-      "if(!msg) return;"
-      "try{ await post('/chat',{msg}); }catch(err){console.log(err);}"
-      "$('msg').value='';"
-      "await refresh();"
-    "});"
-  "});"
+    async function loadMetrics(){
+      const j=await apiGet("/data");
+      if(!j || j.ok===false){
+        $("knownCount").textContent="--";
+        $("curCount").textContent="--";
+        $("devicesList").textContent="Metrics unavailable.";
+        return;
+      }
+      $("knownCount").textContent=j.known_devices_count;
+      $("curCount").textContent=j.current_stations;
+      const list=$("devicesList");
+      if(!j.known_devices || j.known_devices.length===0){
+        list.textContent="No devices yet.";
+      }else{
+        list.innerHTML=j.known_devices.map(d=>`<div>#${d.id} - ${d.count} hits</div>`).join("");
+      }
+    }
 
-  "</script>"
-);
+    async function loadTopics(){
+      const j=await apiGet("/api/topics");
+      if(!j || j.ok===false){
+        $("topicsList").innerHTML="<div class='muted'>Forum unavailable.</div>";
+        return;
+      }
+      state.topics=j.topics||[];
+      renderTopics();
+    }
 
-  html += F("</body></html>");
+    function renderTopics(){
+      const list=$("topicsList");
+      if(!state.topics.length){
+        list.innerHTML="<div class='muted'>No topics yet.</div>";
+        return;
+      }
+      list.innerHTML="";
+      state.topics.forEach(t=>{
+        const row=document.createElement("div");
+        row.className="topic";
+        row.onclick=()=>{location.hash="#t/"+t.id;};
+        row.innerHTML=`
+          <div>
+            <div class="title">${t.title}</div>
+            <div class="meta">${t.reply_count} replies - last ${formatMs(t.last_ms)}</div>
+          </div>
+          <div class="split">
+            ${t.encrypted?'<span class="tag">locked</span>':""}
+          </div>`;
+        list.appendChild(row);
+      });
+    }
+
+    async function loadTopic(id){
+      const j=await apiGet("/api/topic?id="+encodeURIComponent(id));
+      state.topic=j;
+      renderTopic();
+    }
+
+    async function renderTopic(){
+      const t=state.topic;
+      if(!t) return;
+      setView("threadView");
+      $("threadTitle").textContent=t.title;
+      $("threadMeta").textContent=`${t.reply_count} replies - created ${formatMs(t.created_ms)}`;
+      $("btnUnlock").classList.toggle("hidden", !t.encrypted);
+
+      const postsEl=$("posts");
+      postsEl.innerHTML="";
+
+      if(t.encrypted && state.decrypted[t.id]){
+        state.decrypted[t.id].forEach(p=>{
+          const div=document.createElement("div");
+          div.className="post";
+          div.innerHTML=`<div class="who">${p.username}</div><div class="time">${formatMs(p.t)}</div><div>${p.body}</div>`;
+          postsEl.appendChild(div);
+        });
+        return;
+      }
+
+      for(const p of t.posts){
+        const div=document.createElement("div");
+        div.className="post";
+        if(p.encrypted && t.encrypted){
+          let body="(locked)";
+          if(cryptoOk && state.passwords[t.id]){
+            try{
+              body=await decryptPayload(state.passwords[t.id], t.kdf_salt_b64, p.payload);
+            }catch(e){
+              body="(locked)";
+            }
+          }
+          div.innerHTML=`<div class="who">${p.username}</div><div class="time">${formatMs(p.t)}</div><div>${body}</div>`;
+        }else{
+          div.innerHTML=`<div class="who">${p.username}</div><div class="time">${formatMs(p.t)}</div><div>${p.payload}</div>`;
+        }
+        postsEl.appendChild(div);
+      }
+    }
+
+    function resetModal(){
+      $("modalName").classList.add("hidden");
+      $("modalTopicTitle").classList.add("hidden");
+      $("modalBody").classList.add("hidden");
+      $("modalEncryptedWrap").classList.add("hidden");
+      $("modalPassword").classList.add("hidden");
+      $("modalWarn").textContent="";
+      $("modalText").textContent="";
+      $("modalName").value="";
+      $("modalTopicTitle").value="";
+      $("modalBody").value="";
+      $("modalPassword").value="";
+      $("modalEncrypted").checked=false;
+    }
+    function openModal(){
+      $("modal").classList.remove("hidden");
+    }
+    function closeModal(){
+      $("modal").classList.add("hidden");
+      state.modalMode="";
+      resetModal();
+    }
+
+    function openNameModal(){
+      resetModal();
+      state.modalMode="name";
+      $("modalTitle").textContent="Set username";
+      $("modalText").textContent="This name is stored per device.";
+      $("modalName").classList.remove("hidden");
+      openModal();
+    }
+
+    function openTopicModal(){
+      resetModal();
+      state.modalMode="topic";
+      $("modalTitle").textContent="New topic";
+      $("modalText").textContent="Create a new topic and first post.";
+      $("modalTopicTitle").classList.remove("hidden");
+      $("modalBody").classList.remove("hidden");
+      $("modalEncryptedWrap").classList.remove("hidden");
+      if(!cryptoOk){
+        $("modalWarn").textContent="WebCrypto unavailable. Password will be sent in plaintext to the device.";
+      }
+      openModal();
+    }
+
+    function openReplyModal(){
+      const t=state.topic;
+      if(!t) return;
+      resetModal();
+      state.modalMode="reply";
+      $("modalTitle").textContent="Reply";
+      $("modalText").textContent="Post a reply to this topic.";
+      $("modalBody").classList.remove("hidden");
+      if(t.encrypted){
+        if(!cryptoOk || !state.passwords[t.id]){
+          $("modalPassword").classList.remove("hidden");
+          if(!cryptoOk){
+            $("modalWarn").textContent="Password will be sent in plaintext over open Wi-Fi.";
+          }
+        }
+      }
+      openModal();
+    }
+
+    async function unlockTopic(){
+      const t=state.topic;
+      if(!t) return;
+      const password=$("modalPassword").value.trim();
+      if(!password) return;
+      if(cryptoOk){
+        state.passwords[t.id]=password;
+        closeModal();
+        await renderTopic();
+      }else{
+        $("modalWarn").textContent="Warning: password will be sent in plaintext over open Wi-Fi.";
+        try{
+          const j=await apiPost("/api/decrypt",{id:t.id,password});
+          if(!j.ok){ $("modalWarn").textContent="Wrong password."; return; }
+          state.decrypted[t.id]=j.posts||[];
+          closeModal();
+          await renderTopic();
+        }catch(e){
+          $("modalWarn").textContent="Decrypt failed.";
+        }
+      }
+    }
+
+    async function createTopicFromModal(){
+      const title=$("modalTopicTitle").value.trim();
+      const body=$("modalBody").value.trim();
+      const encrypted=$("modalEncrypted").checked;
+      const password=$("modalPassword").value.trim();
+      if(!title || !body) return;
+
+      if(encrypted && !password){
+        alert("Password required for encrypted topics.");
+        return;
+      }
+      let payload="";
+      let salt="";
+      if(encrypted){
+        if(cryptoOk){
+          const saltBytes=crypto.getRandomValues(new Uint8Array(16));
+          salt=bytesToB64(saltBytes);
+          payload=await encryptText(password, salt, body);
+        }
+      }
+
+      const res=await apiPost("/api/topics",{
+        title, body,
+        enc: encrypted ? "1" : "0",
+        payload,
+        salt,
+        password: encrypted && !cryptoOk ? password : ""
+      });
+      if(res.ok){
+        closeModal();
+        location.hash="#t/"+res.id;
+      }else{
+        $("modalWarn").textContent="Create failed: " + (res.err || "unknown");
+      }
+    }
+
+    async function replyFromModal(){
+      const t=state.topic;
+      if(!t) return;
+      const body=$("modalBody").value.trim();
+      if(!body) return;
+      let payload="";
+      let password="";
+
+      if(t.encrypted){
+        if(cryptoOk){
+          let pw=state.passwords[t.id];
+          if(!pw){
+            password=$("modalPassword").value.trim();
+            if(!password) return;
+            state.passwords[t.id]=password;
+            pw=password;
+          }
+          payload=await encryptText(pw, t.kdf_salt_b64, body);
+        }else{
+          password=$("modalPassword").value.trim();
+          if(!password) return;
+        }
+      }
+      const res=await apiPost("/api/post",{
+        id:t.id,
+        body,
+        payload,
+        password
+      });
+      if(res.ok){
+        closeModal();
+        await loadTopic(t.id);
+      }else{
+        $("modalWarn").textContent="Reply failed: " + (res.err || "unknown");
+      }
+    }
+
+    function route(){
+      const h=location.hash || "#forum";
+      if(h.startsWith("#t/")){
+        const id=h.slice(3);
+        setTab("forum");
+        loadTopic(id);
+      }else if(h==="#profile"){
+        setTab("profile");
+      }else if(h==="#metrics"){
+        setTab("metrics");
+        loadMetrics();
+      }else{
+        setTab("forum");
+        setView("topicsView");
+        loadTopics();
+      }
+    }
+
+    document.addEventListener("DOMContentLoaded", async ()=>{
+      $("cryptoState").textContent=cryptoOk ? "WebCrypto OK" : "WebCrypto unavailable";
+      $("modalEncrypted").addEventListener("change", ()=>{
+        if($("modalEncrypted").checked){
+          $("modalPassword").classList.remove("hidden");
+        }else{
+          $("modalPassword").classList.add("hidden");
+        }
+      });
+
+      $("tabForum").addEventListener("click", ()=>{location.hash="#forum";});
+      $("tabProfile").addEventListener("click", ()=>{location.hash="#profile";});
+      $("tabMetrics").addEventListener("click", ()=>{location.hash="#metrics";});
+
+      $("btnSetName").addEventListener("click", openNameModal);
+      $("shareLoc").addEventListener("click", shareLoc);
+      $("btnTopics").addEventListener("click", ()=>{location.hash="#forum"; setView("topicsView");});
+      $("btnNew").addEventListener("click", openTopicModal);
+      $("btnBack").addEventListener("click", ()=>location.hash="#forum");
+      $("btnReply").addEventListener("click", openReplyModal);
+      $("btnUnlock").addEventListener("click", ()=>{resetModal();$("modalTitle").textContent="Unlock topic";$("modalText").textContent="Enter password to decrypt posts.";$("modalPassword").classList.remove("hidden");state.modalMode="unlock";openModal();});
+      $("modalCancel").addEventListener("click", closeModal);
+      $("modalOk").addEventListener("click", async ()=>{
+        if(state.modalMode==="name"){
+          await saveName($("modalName").value);
+          closeModal();
+        }else if(state.modalMode==="topic"){
+          await createTopicFromModal();
+        }else if(state.modalMode==="reply"){
+          await replyFromModal();
+        }else if(state.modalMode==="unlock"){
+          await unlockTopic();
+        }
+      });
+      window.addEventListener("hashchange", route);
+
+      await loadMe();
+      await loadMetrics();
+      await loadTopics();
+      route();
+      setInterval(loadMetrics, 7000);
+
+      setTimeout(()=>{ try{ shareLoc(); }catch(e){} }, 600);
+    });
+  </script>
+</body>
+</html>
+  )rawliteral";
   return html;
 }
 
@@ -705,7 +1447,7 @@ void redirectToPortal() {
   IPAddress ip = WiFi.softAPIP();
   server.sendHeader("Location", String("http://") + ip.toString() + "/");
   sendNoCacheHeaders();
-  server.send(302, "text/plain", "Redirecting to captive portal…");
+  server.send(302, "text/plain", "Redirecting to captive portal...");
 }
 
 void handleMe() {
@@ -713,14 +1455,22 @@ void handleMe() {
 
   String mac = clientMacFromRequest();
   String uname = getUsernameForMac(mac);
+  String authorId = anonymizeKey(mac);
 
   SessionLoc sl;
   bool hasSessionLoc = getSessionLoc(mac, sl);
 
+  bool includeKey = server.hasArg("raw") && server.arg("raw") == "1";
+
   String out;
   out.reserve(512);
   out += "{";
-  out += "\"mac\":\"" + mac + "\",";
+  if (includeKey) {
+    out += "\"key\":\"" + mac + "\",";
+  } else {
+    out += "\"key\":\"\",";
+  }
+  out += "\"anonymized_id\":\"" + authorId + "\",";
   out += "\"username\":\"" + jsonEscape(uname) + "\",";
   out += "\"session_location\":";
   if (hasSessionLoc) {
@@ -735,11 +1485,12 @@ void handleMe() {
   }
   out += ",\"node_location\":";
   if (nodeLoc.has) {
+    String byId = anonymizeKey(nodeLoc.byMac);
     out += "{";
     out += "\"lat\":" + String(nodeLoc.lat, 6) + ",";
     out += "\"lon\":" + String(nodeLoc.lon, 6) + ",";
     out += "\"acc\":" + String(nodeLoc.acc, 1) + ",";
-    out += "\"by_mac\":\"" + nodeLoc.byMac + "\",";
+    out += "\"by_id\":\"" + byId + "\",";
     out += "\"last_ms\":" + String(nodeLoc.lastMs);
     out += "}";
   } else {
@@ -800,72 +1551,36 @@ void handleData() {
   sendNoCacheHeaders();
 
   String out;
-  out.reserve(8192);
+  out.reserve(4096);
   out += "{";
 
   out += "\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
   out += "\"current_stations\":" + String(WiFi.softAPgetStationNum()) + ",";
 
-  // devices (keep as before)
+  out += "\"known_devices_count\":" + String(deviceCount) + ",";
   out += "\"known_devices\":[";
   for (size_t i = 0; i < deviceCount; i++) {
     if (i) out += ",";
+    String anon = anonymizeKey(devices[i].mac);
     out += "{";
-    out += "\"mac\":\"" + devices[i].mac + "\",";
+    out += "\"id\":\"" + anon + "\",";
     out += "\"count\":" + String(devices[i].count) + ",";
     out += "\"last_seen_ms\":" + String(devices[i].lastSeenMs);
     out += "}";
   }
   out += "],";
 
-  // messages v2 objects
-  out += "\"messages\":[";
-  bool first = true;
-
-  if (SPIFFS.exists(MESSAGES_FILE)) {
-    File f = SPIFFS.open(MESSAGES_FILE, FILE_READ);
-    if (f) {
-      while (f.available()) {
-        String line = f.readStringUntil('\n');
-        line.trim();
-        if (!line.length()) continue;
-
-        // t|mac|user|lat|lon|acc|msg
-        int p1 = line.indexOf('|');
-        int p2 = line.indexOf('|', p1 + 1);
-        int p3 = line.indexOf('|', p2 + 1);
-        int p4 = line.indexOf('|', p3 + 1);
-        int p5 = line.indexOf('|', p4 + 1);
-        int p6 = line.indexOf('|', p5 + 1);
-        if (p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0 || p5 < 0 || p6 < 0) continue;
-
-        String t   = line.substring(0, p1);
-        String mac = line.substring(p1 + 1, p2);
-        String usr = line.substring(p2 + 1, p3);
-        String lat = line.substring(p3 + 1, p4);
-        String lon = line.substring(p4 + 1, p5);
-        String acc = line.substring(p5 + 1, p6);
-        String msg = line.substring(p6 + 1);
-
-        if (!first) out += ",";
-        first = false;
-
-        out += "{";
-        out += "\"t\":" + String((uint32_t)t.toInt()) + ",";
-        out += "\"mac\":\"" + jsonEscape(mac) + "\",";
-        out += "\"user\":\"" + jsonEscape(usr) + "\",";
-        if (lat.length() && lon.length()) {
-          out += "\"lat\":" + lat + ",";
-          out += "\"lon\":" + lon + ",";
-          out += "\"acc\":" + (acc.length() ? acc : "0") + ",";
-        } else {
-          out += "\"lat\":null,\"lon\":null,\"acc\":null,";
-        }
-        out += "\"msg\":\"" + jsonEscape(msg) + "\"";
-        out += "}";
-      }
-      f.close();
-    }
+  out += "\"recent_topics\":[";
+  for (size_t i = 0; i < topicCount && i < 5; i++) {
+    if (i) out += ",";
+    TopicMeta& t = topics[i];
+    out += "{";
+    out += "\"id\":\"" + t.id + "\",";
+    out += "\"title\":\"" + jsonEscape(t.title) + "\",";
+    out += "\"reply_count\":" + String(t.replyCount) + ",";
+    out += "\"last_ms\":" + String(t.lastMs) + ",";
+    out += "\"encrypted\":" + String(t.encrypted ? "1" : "0");
+    out += "}";
   }
   out += "]";
 
@@ -874,27 +1589,303 @@ void handleData() {
   server.send(200, "application/json", out);
 }
 
-void handleChatPost() {
-  String msg = server.hasArg("msg") ? server.arg("msg") : "";
-  String mac = clientMacFromRequest();
-  String uname = getUsernameForMac(mac);
-
-  SessionLoc sl;
-  bool hasLoc = getSessionLoc(mac, sl);
-
-  appendMessageV2(mac, uname, hasLoc, sl.lat, sl.lon, sl.acc, msg);
-
-  // If form-submitted, redirect; if fetch(), return JSON
-  String xrw = server.header("X-Requested-With");
-  if (xrw.length()) {
-    sendNoCacheHeaders();
-    server.send(200, "application/json", "{\"ok\":true}");
-  } else {
-    redirectToPortal();
+void handleApiTopicsGet() {
+  sendNoCacheHeaders();
+  String out;
+  out.reserve(4096);
+  out += "{";
+  out += "\"topics\":[";
+  for (size_t i = 0; i < topicCount; i++) {
+    if (i) out += ",";
+    TopicMeta& t = topics[i];
+    out += "{";
+    out += "\"id\":\"" + t.id + "\",";
+    out += "\"created_ms\":" + String(t.createdMs) + ",";
+    out += "\"last_ms\":" + String(t.lastMs) + ",";
+    out += "\"reply_count\":" + String(t.replyCount) + ",";
+    out += "\"creator_id\":\"" + t.creatorId + "\",";
+    out += "\"encrypted\":" + String(t.encrypted ? "1" : "0") + ",";
+    out += "\"title\":\"" + jsonEscape(t.title) + "\",";
+    out += "\"kdf_salt_b64\":\"" + t.saltB64 + "\",";
+    out += "\"topic_nonce_b64\":\"" + t.nonceB64 + "\"";
+    out += "}";
   }
+  out += "]}";
+  server.send(200, "application/json", out);
 }
 
-// Some OS captive-check endpoints (we’ll redirect them to the portal)
+void handleApiTopicsPost() {
+  sendNoCacheHeaders();
+  String title = server.hasArg("title") ? server.arg("title") : "";
+  String body = server.hasArg("body") ? server.arg("body") : "";
+  String encStr = server.hasArg("enc") ? server.arg("enc") : "0";
+  bool encrypted = encStr == "1";
+
+  title = sanitizeField(title, MAX_TITLE_LEN);
+  body = sanitizeField(body, MAX_BODY_LEN);
+  if (!title.length()) {
+    server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing_title\"}");
+    return;
+  }
+  if (!encrypted && !body.length()) {
+    server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing_body\"}");
+    return;
+  }
+
+  String mac = clientMacFromRequest();
+  String authorId = anonymizeKey(mac);
+  String uname = getUsernameForMac(mac);
+
+  TopicMeta t;
+  t.id = generateTopicId();
+  t.createdMs = millis();
+  t.lastMs = t.createdMs;
+  t.replyCount = 0;
+  t.creatorId = authorId;
+  t.encrypted = encrypted;
+  t.title = title;
+  t.saltB64 = "";
+  t.nonceB64 = "";
+
+  String payload;
+  if (encrypted) {
+    String saltB64 = server.hasArg("salt") ? server.arg("salt") : "";
+    if (!saltB64.length()) {
+      uint8_t salt[16];
+      for (size_t i = 0; i < sizeof(salt); i += 4) {
+        uint32_t r = esp_random();
+        memcpy(salt + i, &r, (sizeof(salt) - i >= 4) ? 4 : (sizeof(salt) - i));
+      }
+      base64Encode(salt, sizeof(salt), saltB64);
+    }
+    t.saltB64 = saltB64;
+    t.nonceB64 = server.hasArg("topic_nonce") ? server.arg("topic_nonce") : "";
+
+    payload = server.hasArg("payload") ? server.arg("payload") : "";
+    if (!payload.length()) {
+      String password = server.hasArg("password") ? server.arg("password") : "";
+      if (!password.length()) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing_payload\"}");
+        return;
+      }
+      if (!body.length()) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing_body\"}");
+        return;
+      }
+      if (!encryptWithPassword(password, t.saltB64, body, payload)) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"encrypt_failed\"}");
+        return;
+      }
+    }
+  } else {
+    payload = body;
+  }
+
+  if (topicCount >= MAX_TOPICS) trimTopicsIfNeeded();
+  topics[topicCount++] = t;
+  saveTopicsIndex();
+
+  appendPost(t.id, authorId, uname, encrypted, payload);
+
+  String out = String("{\"ok\":true,\"id\":\"") + t.id + "\"}";
+  server.send(200, "application/json", out);
+}
+
+void handleApiTopicGet() {
+  sendNoCacheHeaders();
+  String id = server.hasArg("id") ? server.arg("id") : "";
+  if (!isSafeTopicId(id)) {
+    server.send(400, "application/json", "{\"ok\":false,\"err\":\"bad_id\"}");
+    return;
+  }
+  int idx = findTopicIndex(id);
+  if (idx < 0) {
+    server.send(404, "application/json", "{\"ok\":false,\"err\":\"not_found\"}");
+    return;
+  }
+
+  TopicMeta& t = topics[idx];
+  String out;
+  out.reserve(8192);
+  out += "{";
+  out += "\"id\":\"" + t.id + "\",";
+  out += "\"created_ms\":" + String(t.createdMs) + ",";
+  out += "\"last_ms\":" + String(t.lastMs) + ",";
+  out += "\"reply_count\":" + String(t.replyCount) + ",";
+  out += "\"creator_id\":\"" + t.creatorId + "\",";
+  out += "\"encrypted\":" + String(t.encrypted ? "1" : "0") + ",";
+  out += "\"title\":\"" + jsonEscape(t.title) + "\",";
+  out += "\"kdf_salt_b64\":\"" + t.saltB64 + "\",";
+  out += "\"topic_nonce_b64\":\"" + t.nonceB64 + "\",";
+  out += "\"posts\":[";
+
+  String path = topicFilePath(t.id);
+  bool first = true;
+  if (SPIFFS.exists(path)) {
+    File f = SPIFFS.open(path, FILE_READ);
+    if (f) {
+      while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (!line.length()) continue;
+        int p1 = line.indexOf('|');
+        int p2 = line.indexOf('|', p1 + 1);
+        int p3 = line.indexOf('|', p2 + 1);
+        int p4 = line.indexOf('|', p3 + 1);
+        if (p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0) continue;
+        String ts = line.substring(0, p1);
+        String authorId = line.substring(p1 + 1, p2);
+        String user = line.substring(p2 + 1, p3);
+        String enc = line.substring(p3 + 1, p4);
+        String payload = line.substring(p4 + 1);
+
+        if (!first) out += ",";
+        first = false;
+
+        out += "{";
+        out += "\"t\":" + String((uint32_t)ts.toInt()) + ",";
+        out += "\"author_id\":\"" + authorId + "\",";
+        out += "\"username\":\"" + jsonEscape(displayNameFor(user, authorId)) + "\",";
+        out += "\"encrypted\":" + String(enc.toInt() == 1 ? "1" : "0") + ",";
+        out += "\"payload\":\"" + jsonEscape(payload) + "\"";
+        out += "}";
+      }
+      f.close();
+    }
+  }
+  out += "]}";
+
+  server.send(200, "application/json", out);
+}
+
+void handleApiPost() {
+  sendNoCacheHeaders();
+  String id = server.hasArg("id") ? server.arg("id") : "";
+  if (!isSafeTopicId(id)) {
+    server.send(400, "application/json", "{\"ok\":false,\"err\":\"bad_id\"}");
+    return;
+  }
+  int idx = findTopicIndex(id);
+  if (idx < 0) {
+    server.send(404, "application/json", "{\"ok\":false,\"err\":\"not_found\"}");
+    return;
+  }
+
+  TopicMeta& t = topics[idx];
+  String mac = clientMacFromRequest();
+  String authorId = anonymizeKey(mac);
+  String uname = getUsernameForMac(mac);
+
+  String payload;
+  if (t.encrypted) {
+    payload = server.hasArg("payload") ? server.arg("payload") : "";
+    if (!payload.length()) {
+      String password = server.hasArg("password") ? server.arg("password") : "";
+      String body = server.hasArg("body") ? server.arg("body") : "";
+      body = sanitizeField(body, MAX_BODY_LEN);
+      if (!password.length() || !body.length()) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing_payload\"}");
+        return;
+      }
+      if (!encryptWithPassword(password, t.saltB64, body, payload)) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"encrypt_failed\"}");
+        return;
+      }
+    }
+  } else {
+    String body = server.hasArg("body") ? server.arg("body") : "";
+    body = sanitizeField(body, MAX_BODY_LEN);
+    if (!body.length()) {
+      server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing_body\"}");
+      return;
+    }
+    payload = body;
+  }
+
+  appendPost(t.id, authorId, uname, t.encrypted, payload);
+  t.replyCount++;
+  t.lastMs = millis();
+  saveTopicsIndex();
+
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiDecrypt() {
+  sendNoCacheHeaders();
+  String id = server.hasArg("id") ? server.arg("id") : "";
+  if (!isSafeTopicId(id)) {
+    server.send(400, "application/json", "{\"ok\":false,\"err\":\"bad_id\"}");
+    return;
+  }
+  String password = server.hasArg("password") ? server.arg("password") : "";
+  if (!password.length()) {
+    server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing_password\"}");
+    return;
+  }
+  int idx = findTopicIndex(id);
+  if (idx < 0) {
+    server.send(404, "application/json", "{\"ok\":false,\"err\":\"not_found\"}");
+    return;
+  }
+  TopicMeta& t = topics[idx];
+  if (!t.encrypted) {
+    server.send(400, "application/json", "{\"ok\":false,\"err\":\"not_encrypted\"}");
+    return;
+  }
+
+  String out;
+  out.reserve(8192);
+  out += "{";
+  out += "\"ok\":true,";
+  out += "\"posts\":[";
+
+  String path = topicFilePath(t.id);
+  bool first = true;
+  if (SPIFFS.exists(path)) {
+    File f = SPIFFS.open(path, FILE_READ);
+    if (f) {
+      while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (!line.length()) continue;
+        int p1 = line.indexOf('|');
+        int p2 = line.indexOf('|', p1 + 1);
+        int p3 = line.indexOf('|', p2 + 1);
+        int p4 = line.indexOf('|', p3 + 1);
+        if (p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0) continue;
+        String ts = line.substring(0, p1);
+        String authorId = line.substring(p1 + 1, p2);
+        String user = line.substring(p2 + 1, p3);
+        String enc = line.substring(p3 + 1, p4);
+        String payload = line.substring(p4 + 1);
+
+        String plain = "";
+        if (enc.toInt() == 1) {
+          if (!decryptWithPassword(password, t.saltB64, payload, plain)) {
+            server.send(400, "application/json", "{\"ok\":false,\"err\":\"bad_password\"}");
+            return;
+          }
+        } else {
+          plain = payload;
+        }
+
+        if (!first) out += ",";
+        first = false;
+        out += "{";
+        out += "\"t\":" + String((uint32_t)ts.toInt()) + ",";
+        out += "\"author_id\":\"" + authorId + "\",";
+        out += "\"username\":\"" + jsonEscape(displayNameFor(user, authorId)) + "\",";
+        out += "\"body\":\"" + jsonEscape(plain) + "\"";
+        out += "}";
+      }
+      f.close();
+    }
+  }
+  out += "]}";
+  server.send(200, "application/json", out);
+}
+
+// Some OS captive-check endpoints (we'll redirect them to the portal)
 void handleCaptiveEndpoints() {
   redirectToPortal();
 }
@@ -970,13 +1961,11 @@ void setup() {
   if (!SPIFFS.begin(true)) {
     Serial.println("SPIFFS mount failed!");
   } else {
+    loadSecret();
     loadDevicesFromSPIFFS();
     loadUsersFromSPIFFS();
     loadNodeLocFromSPIFFS();
-    if (!SPIFFS.exists(MESSAGES_FILE)) {
-      File nf = SPIFFS.open(MESSAGES_FILE, FILE_WRITE);
-      if (nf) nf.close();
-    }
+    loadTopicsIndex();
   }
 
   // LED
@@ -1000,7 +1989,11 @@ void setup() {
   // Web routes
   server.on("/", HTTP_GET, handleRoot);
   server.on("/data", HTTP_GET, handleData);
-  server.on("/chat", HTTP_POST, handleChatPost);
+  server.on("/api/topics", HTTP_GET, handleApiTopicsGet);
+  server.on("/api/topics", HTTP_POST, handleApiTopicsPost);
+  server.on("/api/topic", HTTP_GET, handleApiTopicGet);
+  server.on("/api/post", HTTP_POST, handleApiPost);
+  server.on("/api/decrypt", HTTP_POST, handleApiDecrypt);
   server.on("/me", HTTP_GET, handleMe);
   server.on("/setname", HTTP_POST, handleSetName);
   server.on("/setloc", HTTP_POST, handleSetLoc);
